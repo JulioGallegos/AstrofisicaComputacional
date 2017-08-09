@@ -1,0 +1,229 @@
+import tarfile
+#if you have already downloaded the data, the code below will fail, so skip it
+from astropy.utils.data import download_file
+url = 'http://data.astropy.org/tutorials/UVES/data_UVES.tar.gz'
+f = tarfile.open(download_file(url, cache=True), mode='r|*')
+working_dir_path = '.'  # CHANGE TO WHEREVER YOU WANT THE DATA TO BE EXTRACTED
+f.extractall(path=working_dir_path)
+
+from glob import glob
+import os
+
+import numpy as np
+
+from astropy.wcs import WCS
+from astropy.io import fits
+
+# os.path.join is a platform-independent way to join two directories
+globpath = os.path.join(working_dir_path, 'UVES/*.fits')
+
+print(globpath)
+# glob searches through directories similar to the Unix shell
+filelist = glob(globpath)
+
+# sort alphabetically - given the way the filenames are
+# this also sorts in time
+filelist.sort()
+
+sp = fits.open(filelist[0])
+sp.info()
+
+header = sp[0].header
+
+wcs = WCS(header)
+#make index array
+index = np.arange(header['NAXIS1'])
+
+wavelength = wcs.wcs_pix2world(index[:,np.newaxis], 0)
+wavelength.shape
+#Ahh, this has the wrong dimension. So we flatten it.
+wavelength = wavelength.flatten()
+
+flux = sp[0].data
+
+# hay un programa asociado llamado spectra_utils, que contiene varias funciones
+# el programa spectra_utils.py esta también en el campus virtual
+
+import spectra_utils
+
+flux = np.zeros((len(filelist), len(wavelength)))
+# date comes as string with 23 characters (dtype = 'S23')
+date = np.zeros((len(filelist)), dtype = 'S23')
+
+for i, fname in enumerate(filelist):
+    w, f, date_obs = read_spec(fname)
+    flux[i,:] = f
+    date[i] = date_obs
+    
+import astropy.units as u
+from astropy.constants.si import c, G, M_sun, R_sun
+
+wavelength = wavelength * u.AA
+
+# Let's define some constants we need for the exercises further down
+# Again, we multiply the value with a unit here
+heliocentric = -23. * u.km/u.s
+v_rad = -4.77 * u.km / u.s  # Strassmeier et al. (2005)
+R_MN_Lup = 0.9 * R_sun      # Strassmeier et al. (2005)
+M_MN_Lup = 0.6 * M_sun      # Strassmeier et al. (2005)
+vsini = 74.6 * u.km / u.s   # Strassmeier et al. (2005)
+period = 0.439 * u.day      # Strassmeier et al. (2005)
+
+inclination = 45. * u.degree # Strassmeier et al. (2005)
+# All numpy trigonometric functions expect the input in radian.
+# So far, astropy does not know this, so we need to convert the
+# angle manually
+incl = inclination.to(u.radian)
+
+v_accr = (2.* G * M_MN_Lup/R_MN_Lup)**0.5 
+print(v_accr)
+
+v_rot = vsini / np.sin(incl)
+v_accr / v_rot
+
+(v_accr / v_rot).decompose()
+
+wavelength = wavelength * (1. + heliocentric/c)
+
+wavelength.to(u.keV, equivalencies=u.spectral())
+wavelength.to(u.Hz, equivalencies=u.spectral())
+
+print(np.log10((G*M_MN_Lup/R_MN_Lup**2)/u.cm*u.second**2))
+
+waveclosetoHa = np.array([6562.,6563,6565.]) * u.AA
+
+from astropy.time import Time
+t1 = Time(header['MJD-Obs'], format = 'mjd', scale = 'utc')
+t2 = Time(header['Date-Obs'], scale = 'utc')
+
+
+obs_times = Time(date, scale = 'utc')
+delta_t = obs_times - Time(date[0], scale = 'utc')
+
+delta_p = delta_t.value * u.day / period
+
+#region_around_line es otra función en spectra_utils
+
+wcaII, fcaII = region_around_line(wavelength, flux,
+    [[3925*u.AA, 3930*u.AA],[3938*u.AA, 3945*u.AA]])
+    
+ew = fcaII[0,:] - 1.
+ew = ew[:-1] * np.diff(wcaII.to(u.AA).value)
+print(ew.sum())
+
+delta_lam = np.diff(wcaII.to(u.AA).value)
+ew = np.sum((fcaII - 1.)[:,:-1] * delta_lam[np.newaxis, :], axis=1)
+
+x = w2vsini(wcaII, 393.366 * u.nm).decompose()
+
+import matplotlib.pyplot as plt
+# set reasonable figsize for 1-column figures
+fig = plt.figure(figsize = (4,3))
+ax = fig.add_subplot(1,1,1)
+ax.plot(x, fcaII[0,:])
+ax.set_xlim([-3,+3])
+ax.set_xlabel('line shift [v sin(i)]')
+ax.set_ylabel('flux')
+ax.set_title('Ca II H line in MN Lup')
+# when using this interface, we need to explicitly call the draw routine
+plt.draw()
+
+# ahora probemos esto
+yshift = np.arange((fcaII.shape[0])) * 0.5
+#shift the second night up by a little more
+yshift[:] += 1.5
+yshift[13:] += 1
+
+fig = plt.figure(figsize = (4,3))
+ax = fig.add_subplot(1,1,1)
+
+for i in range(25):
+    ax.plot(x, fcaII[i,:]+yshift[i], 'k')
+
+#separately show the mean line profile in a different color
+ax.plot(x, np.mean(fcaII, axis =0), 'b')
+ax.set_xlim([-2.5,+2.5])
+ax.set_xlabel('line shift [$v \\sin i$]')
+ax.set_ylabel('flux')
+ax.set_title('Ca II H line in MN Lup')
+fig.subplots_adjust(bottom = 0.15)
+plt.draw()
+
+fmean = np.mean(fcaII, axis=0)
+fdiff = fcaII - fmean[np.newaxis,:]
+
+fig = plt.figure(figsize = (4,3))
+ax = fig.add_subplot(1,1,1)
+im = ax.imshow(fdiff, aspect = "auto", origin = 'lower')
+
+ind1 = delta_p < 1 * u.dimensionless_unscaled
+ind2 = delta_p > 1 * u.dimensionless_unscaled
+
+fig = plt.figure(figsize = (4,3))
+ax = fig.add_subplot(1,1,1)
+
+for ind in [ind1, ind2]:
+    im = ax.imshow(fdiff[ind,:], extent = (np.min(x), np.max(x), np.min(delta_p[ind]), 
+    np.max(delta_p[ind])), aspect = "auto", origin = 'lower')
+
+ax.set_ylim([np.min(delta_p), np.max(delta_p)])
+ax.set_xlim([-1.9,1.9])
+plt.draw()
+
+#seguimos mejorando
+
+# shift a little for plotting purposes
+pplot = delta_p.copy().value
+pplot[ind2] -= 1.5
+# image goes from x1 to x2, but really x1 should be middle of first pixel
+delta_t = np.median(np.diff(delta_p))/2.
+delta_x = np.median(np.diff(x))/2.
+# imshow does the normalization for plotting really well, but here I do it
+# by hand to ensure it goes -1,+1 (that makes color bar look good)
+fdiff = fdiff / np.max(np.abs(fdiff))
+
+fig = plt.figure(figsize = (4,3))
+ax = fig.add_subplot(1,1,1)
+
+for ind in [ind1, ind2]:
+    im = ax.imshow(fdiff[ind,:],
+    extent = (np.min(x)-delta_x, np.max(x)+delta_x,
+    np.min(pplot[ind])-delta_t, np.max(pplot[ind])+delta_t),
+    aspect = "auto", origin = 'lower', cmap = plt.cm.Greys_r)
+
+ax.set_ylim([np.min(pplot)-delta_t, np.max(pplot)+delta_t])
+ax.set_xlim([-1.9,1.9])
+ax.set_xlabel('vel in $v\\sin i$')
+ax.xaxis.set_major_locator(plt.MaxNLocator(4))
+
+def pplot(y, pos):
+    'The two args are the value and tick position'
+    'Function to make tick labels look good.'
+    if y < 0.5:
+        yreal = y
+    else:
+        yreal = y + 1.5
+    return yreal
+
+formatter = plt.FuncFormatter(pplot)
+ax.yaxis.set_major_formatter(formatter)
+ax.set_ylabel('period')
+fig.subplots_adjust(left = 0.15, bottom = 0.15, right = 0.99, top = 0.99)
+plt.draw()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
